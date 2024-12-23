@@ -25,6 +25,40 @@ def make_warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor, warmup_dela
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, f)
 
+# state_dict = {
+#     'model_state_dict': model.module.state_dict(),
+#     # 'optimizer_state_dict': optimizer.param_groups[0]['lr'],
+#     # 'scheduler_state_dict': lr_scheduler.state_dict() if lr_scheduler else None,
+#     'epoch': epoch,
+#     'sumary_epoch': summary_epoch,
+#     'train_loss': train_loss,
+#     'train_task_losses': train_task_losses,
+#     'val_loss': val_loss,
+#     'val_task_losses': val_task_losses,
+#     'val_score': val_score,
+#     'best_score': best_score,
+#     'val_scores': val_scores,
+#     'scaler_state_dict': scaler.state_dict() if scaler else None,
+#     'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+#     'time - eval_time': int(time.time()-eval_time),
+#     'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+# }
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, scaler=None):
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    if optimizer:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scaler:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    print(f"Checkpoint loaded from {checkpoint_path}")
+    return checkpoint
+
+def resume_from_checkpoint(checkpoint_path, model, optimizer, scaler):
+    checkpoint = load_checkpoint(checkpoint_path, model, optimizer, scaler)
+    return checkpoint['epoch'], checkpoint['best_score'], checkpoint['loss']
+
 def save_atomic(state_dict, dir_name, fname):
     tmp_fname = fname+'.tmp'
     torch.save(state_dict, os.path.join(dir_name, tmp_fname))
@@ -134,23 +168,39 @@ def main(args, config):
     # Load model if requested.
     if 'RestorePath' in config:
         if primary: print('restoring from', config['RestorePath'])
-        state_dict = torch.load(config['RestorePath'], map_location=device)
+        state_dict = {
+            'model_state_dict': torch.load(config['RestorePath'], map_location=device),
+            'epoch': epoch,
+            'sumary_epoch': summary_epoch,
+            'train_loss': train_loss,
+            'train_task_losses': train_task_losses,
+            'val_loss': val_loss,
+            'val_task_losses': val_task_losses,
+            'val_score': val_score,
+            'best_score': best_score,
+            'val_scores': val_scores,
+            'scaler_state_dict': scaler.state_dict() if scaler else None,
+            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+            'time - eval_time': int(time.time()-eval_time),
+            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+        }
+        # state_dict = torch.load(config['RestorePath'], map_location=device)
 
         # Deal with when model weights are in .pth.tar format.
         if config['RestorePath'].endswith('.pth.tar'):
-            state_dict = state_dict['state_dict']
+            state_dict['model_state_dict'] = state_dict['state_dict']
 
         # By default, don't restore model heads.
         # We only restore head if special RestoreHead key is set.
         if not 'RestoreHead' in config:
-            for k in list(state_dict.keys()):
+            for k in list(state_dict['model_state_dict'].keys()):
                 if k.startswith('heads.'):
-                    del state_dict[k]
+                    del state_dict['model_state_dict'][k]
 
         # User can specify specific prefixes they would like to restore.
         # We keep the state_dict key if it matches any prefix.
         if 'RestorePrefixes' in config:
-            for k in list(state_dict.keys()):
+            for k in list(state_dict['model_state_dict'].keys()):
                 ok = False
                 for prefix in config['RestorePrefixes']:
                     if not k.startswith(prefix):
@@ -158,7 +208,7 @@ def main(args, config):
                     ok = True
                     break
                 if not ok:
-                    del state_dict[k]
+                    del state_dict['model_state_dict'][k]
 
         # User can also replace prefixes of some keys with another prefix.
         # This is useful when copying the backbone of a slightly different architecture
@@ -166,16 +216,25 @@ def main(args, config):
         # Example: [["", "backbone."]] would prepend "backbone." to every state_dict key.
         if 'RestoreReplacePrefix' in config:
             for old_prefix, new_prefix in config['RestoreReplacePrefix']:
-                for k in list(state_dict.keys()):
+                for k in list(state_dict['model_state_dict'].keys()):
                     if not k.startswith(old_prefix):
                         continue
                     new_k = new_prefix + k[len(old_prefix):]
-                    state_dict[new_k] = state_dict[k]
-                    del state_dict[k]
-
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        if primary and (missing_keys or unexpected_keys):
-            print('missing={}; unexpected={}'.format(missing_keys, unexpected_keys))
+                    state_dict['model_state_dict'][new_k] = state_dict['model_state_dict'][k]
+                    del state_dict['model_state_dict'][k]
+        
+        # missing_keys, unexpected_keys = model.load_state_dict(state_dict['model_state_dict'], strict=False)
+        # if primary and (missing_keys or unexpected_keys):
+        #     print('missing={}; unexpected={}'.format(missing_keys, unexpected_keys))
+        
+        if 'ResumeTraining' in config:
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict['model_state_dict'], strict=False)
+            if primary and (missing_keys or unexpected_keys):
+                print('missing={}; unexpected={}'.format(missing_keys, unexpected_keys))
+        else: 
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            if primary and (missing_keys or unexpected_keys):
+                print('missing={}; unexpected={}'.format(missing_keys, unexpected_keys))
 
     # Move model to the correct device.
     model.to(device)
@@ -259,6 +318,32 @@ def main(args, config):
     num_epochs = config.get('NumEpochs', 100)
     num_iters = config.get('NumExamples', 0) // batch_size // args.world_size
     if primary: print('training for {} epochs'.format(num_epochs))
+    
+    
+    else:
+        state_dict = {
+            'model_state_dict': torch.load(config['RestorePath'], map_location=device),
+            'epoch': epoch,
+            'sumary_epoch': summary_epoch,
+            'train_loss': train_loss,
+            'train_task_losses': train_task_losses,
+            'val_loss': val_loss,
+            'val_task_losses': val_task_losses,
+            'val_score': val_score,
+            'best_score': best_score,
+            'val_scores': val_scores,
+            'scaler_state_dict': scaler.state_dict() if scaler else None,
+            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+            'time - eval_time': int(time.time()-eval_time),
+            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+        }
+        
+        
+        
+        
+        
+        
+        
 
     if 'EffectiveBatchSize' in config:
         accumulate_freq = config['EffectiveBatchSize'] // batch_size // args.world_size
@@ -279,7 +364,6 @@ def main(args, config):
             cur_iterations += 1
 
             images = [image.to(device).float()/255 for image in images]
-
             gpu_targets = [
                 [{k: v.to(device) for k, v in target_dict.items()} for target_dict in cur_targets]
                 for cur_targets in targets
@@ -370,12 +454,61 @@ def main(args, config):
                     # Model saving.
                     if is_distributed:
                         # Need to access underlying model in the DistributedDataParallel so keys aren't prefixed with "module.X".
-                        state_dict = model.module.state_dict()
+                        # state_dict = model.module.state_dict()
+                        state_dict = {
+                            'model_state_dict': model.module.state_dict(),
+                            'epoch': epoch,
+                            'sumary_epoch': summary_epoch,
+                            'train_loss': train_loss,
+                            'train_task_losses': train_task_losses,
+                            'val_loss': val_loss,
+                            'val_task_losses': val_task_losses,
+                            'val_score': val_score,
+                            'best_score': best_score,
+                            'val_scores': val_scores,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+                            'time - eval_time': int(time.time()-eval_time),
+                            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+                        }
                     else:
-                        state_dict = model.state_dict()
+                        # state_dict = model.state_dict()
+                        print('not distributed')
+                        state_dict = {
+                            'model_state_dict': model.module.state_dict(),
+                            'epoch': epoch,
+                            'sumary_epoch': summary_epoch,
+                            'train_loss': train_loss,
+                            'train_task_losses': train_task_losses,
+                            'val_loss': val_loss,
+                            'val_task_losses': val_task_losses,
+                            'val_score': val_score,
+                            'best_score': best_score,
+                            'val_scores': val_scores,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+                            'time - eval_time': int(time.time()-eval_time),
+                            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+                        }
                     save_atomic(state_dict, save_path, 'last.pth')
 
                     if np.isfinite(val_score) and (best_score is None or val_score > best_score):
+                        state_dict = {
+                            'model_state_dict': model.module.state_dict(),
+                            'epoch': epoch,
+                            'sumary_epoch': summary_epoch,
+                            'train_loss': train_loss,
+                            'train_task_losses': train_task_losses,
+                            'val_loss': val_loss,
+                            'val_task_losses': val_task_losses,
+                            'val_score': val_score,
+                            'best_score': best_score,
+                            'val_scores': val_scores,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+                            'time - eval_time': int(time.time()-eval_time),
+                            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+                        }
                         save_atomic(state_dict, save_path, 'best.pth')
                         best_score = val_score
 
