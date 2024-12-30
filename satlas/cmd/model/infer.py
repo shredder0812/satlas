@@ -94,7 +94,7 @@ def main(args):
         state_dict = torch.load(args.weights, map_location=device)
     else:
         state_dict = torch.load(os.path.join(save_path, 'best.pth'), map_location=device)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict['model_state_dict'])
 
     model.to(device)
     model.eval()

@@ -26,9 +26,28 @@ def make_warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor, warmup_dela
     return torch.optim.lr_scheduler.LambdaLR(optimizer, f)
 
 def save_atomic(state_dict, dir_name, fname):
-    tmp_fname = fname+'.tmp'
+    tmp_fname = fname + '.tmp'
     torch.save(state_dict, os.path.join(dir_name, tmp_fname))
     os.rename(os.path.join(dir_name, tmp_fname), os.path.join(dir_name, fname))
+
+def load_checkpoint(model, optimizer, scaler, filepath):
+    state_dict = torch.load(filepath)
+    model.load_state_dict(state_dict['model_state_dict'])
+    optimizer.load_state_dict(state_dict['optimizer_state_dict'])
+    if scaler is not None and 'scaler_state_dict' in state_dict:
+        scaler.load_state_dict(state_dict['scaler_state_dict'])
+    model_state_dict = state_dict['model_state_dict']
+    epoch = state_dict['epoch']
+    summary_epoch = state_dict['summary_epoch']
+    train_loss = state_dict['train_loss']
+    train_task_losses = state_dict['train_task_losses']
+    val_loss = state_dict['val_loss']
+    val_task_losses = state_dict['val_task_losses']
+    val_score = state_dict['val_score']
+    best_score = state_dict['best_score']
+    val_scores = state_dict['val_scores']
+    
+    return model, optimizer, model_state_dict, scaler, epoch, summary_epoch, train_loss, train_task_losses, val_loss, val_task_losses, val_score, val_scores, best_score
 
 def main(args, config):
     rank = args.local_rank
@@ -131,49 +150,32 @@ def main(args, config):
         'tasks': config['Tasks'],
     })
 
+    # Construct optimizer.
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_config = config['Optimizer']
+    if optimizer_config['Name'] == 'adam':
+        optimizer = torch.optim.Adam(params, lr=optimizer_config['InitialLR'])
+    elif optimizer_config['Name'] == 'sgd':
+        optimizer = torch.optim.SGD(params, lr=optimizer_config['InitialLR'])
+
+    # Half-precision stuff.
+    half_enabled = config.get('Half', False)
+    scaler = torch.cuda.amp.GradScaler(enabled=half_enabled)
+
     # Load model if requested.
-    if 'RestorePath' in config:
-        if primary: print('restoring from', config['RestorePath'])
-        state_dict = torch.load(config['RestorePath'], map_location=device)
+    resume_path = config.get('ResumePath', None)
+    if resume_path:
+        if primary: 
+            print('resuming from', resume_path)
 
-        # Deal with when model weights are in .pth.tar format.
-        if config['RestorePath'].endswith('.pth.tar'):
-            state_dict = state_dict['state_dict']
-
-        # By default, don't restore model heads.
-        # We only restore head if special RestoreHead key is set.
-        if not 'RestoreHead' in config:
-            for k in list(state_dict.keys()):
-                if k.startswith('heads.'):
-                    del state_dict[k]
-
-        # User can specify specific prefixes they would like to restore.
-        # We keep the state_dict key if it matches any prefix.
-        if 'RestorePrefixes' in config:
-            for k in list(state_dict.keys()):
-                ok = False
-                for prefix in config['RestorePrefixes']:
-                    if not k.startswith(prefix):
-                        continue
-                    ok = True
-                    break
-                if not ok:
-                    del state_dict[k]
-
-        # User can also replace prefixes of some keys with another prefix.
-        # This is useful when copying the backbone of a slightly different architecture
-        # where the backbone ends up having a different prefix in the model.
-        # Example: [["", "backbone."]] would prepend "backbone." to every state_dict key.
-        if 'RestoreReplacePrefix' in config:
-            for old_prefix, new_prefix in config['RestoreReplacePrefix']:
-                for k in list(state_dict.keys()):
-                    if not k.startswith(old_prefix):
-                        continue
-                    new_k = new_prefix + k[len(old_prefix):]
-                    state_dict[new_k] = state_dict[k]
-                    del state_dict[k]
-
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        model, optimizer, model_state_dict, scaler, list_epoch, list_summary_epoch, list_train_loss, list_train_task_losses, list_val_loss, list_val_task_losses, list_val_score, list_val_scores, list_best_score = load_checkpoint(model, optimizer, scaler, resume_path)
+        best_score = max([x for x in list_best_score if x is not None])
+        summary_epoch = list_summary_epoch[-1]
+        start_epoch = list_epoch[-1] + 1
+        if primary:
+            print('Resuming training from epoch', start_epoch)
+            
+        missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
         if primary and (missing_keys or unexpected_keys):
             print('missing={}; unexpected={}'.format(missing_keys, unexpected_keys))
 
@@ -188,14 +190,6 @@ def main(args, config):
     if primary:
         os.makedirs(save_path, exist_ok=True)
         print('saving to', save_path)
-
-    # Construct optimizer.
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer_config = config['Optimizer']
-    if optimizer_config['Name'] == 'adam':
-        optimizer = torch.optim.Adam(params, lr=optimizer_config['InitialLR'])
-    elif optimizer_config['Name'] == 'sgd':
-        optimizer = torch.optim.SGD(params, lr=optimizer_config['InitialLR'])
 
     # Freeze parameters if desired.
     unfreeze_iters = None
@@ -244,43 +238,44 @@ def main(args, config):
                 cooldown=scheduler_config.get('Cooldown', 5),
             )
 
-    # Half-precision stuff.
-    half_enabled = config.get('Half', False)
-    scaler = torch.cuda.amp.GradScaler(enabled=half_enabled)
-
     # Initialize training loop variables.
-    list_epoch = []
-    list_summary_epoch = []
-    list_train_loss = []
-    list_train_task_losses = []
-    list_val_loss = []
-    list_val_task_losses = []
-    list_val_score = []
-    list_best_score =[]
-    list_val_scores = []
-    
-    best_score = None
-
     cur_iterations = 0
     summary_iters = config.get('SummaryExamples', 8192) // batch_size // args.world_size
-    summary_epoch = 0
+    
     summary_prev_time = time.time()
     train_losses = [[] for _ in config['Tasks']]
+    # train_losses[0] = list_train_task_losses
     num_epochs = config.get('NumEpochs', 100)
     num_iters = config.get('NumExamples', 0) // batch_size // args.world_size
-    if primary: print('training for {} epochs'.format(num_epochs))
-
+    
+    if primary: 
+        print('training from epoch {}/{}'.format(start_epoch, num_epochs))
+        print('count epoch: ', len(list_summary_epoch))
+    print('previous summary_epoch {}: train_loss={} (losses={}) val_loss={} (losses={}) val={}/{} (scores={})'.format(
+                        list_summary_epoch[-1],
+                        list_train_loss[-1],
+                        list_train_task_losses[-1],
+                        list_val_loss[-1],
+                        list_val_task_losses[-1],
+                        list_val_score[-1],
+                        best_score,
+                        list_val_scores[-1],
+                        # int(eval_time-summary_prev_time),
+                        # int(time.time()-eval_time),
+                        # optimizer.param_groups[0]['lr'],
+                    ))
+    
     if 'EffectiveBatchSize' in config:
         accumulate_freq = config['EffectiveBatchSize'] // batch_size // args.world_size
     else:
         accumulate_freq = 1
 
     model.train()
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         if num_iters > 0 and cur_iterations > num_iters:
             break
 
-        if primary: print('begin epoch {}'.format(epoch))
+        if primary: print(f"Starting epoch {epoch}/{num_epochs}")
 
         model.train()
         optimizer.zero_grad()
@@ -304,18 +299,20 @@ def main(args, config):
                 _, losses = model(images, gpu_targets)
 
             loss = losses.mean()
+            # print('loss: ', loss)
             if loss == 0.0:
-                loss = Variable(loss, requires_grad = True)
+                loss = Variable(loss, requires_grad=True)
 
             scaler.scale(loss).backward()
 
-            if cur_iterations == 1 or cur_iterations%accumulate_freq == 0:
-                scaler.step(optimizer)
+            if cur_iterations == 1 or cur_iterations % accumulate_freq == 0:
+                # scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
             for task_idx in range(len(config['Tasks'])):
                 train_losses[task_idx].append(losses[task_idx].item())
+            # print('train_losses[task_idx]: ',train_losses[task_idx])
 
             if unfreeze_iters and cur_iterations >= unfreeze_iters:
                 unfreeze_iters = None
@@ -327,9 +324,10 @@ def main(args, config):
                     print('removing warmup_lr_scheduler')
                     warmup_lr_scheduler = None
 
-            if cur_iterations%summary_iters == 0:
+            if cur_iterations % summary_iters == 0:
                 train_loss = np.mean(train_losses)
                 train_task_losses = [np.mean(losses) for losses in train_losses]
+                # print('train_task_losses: ', train_task_losses)
 
                 for losses in train_losses:
                     del losses[:]
@@ -346,9 +344,10 @@ def main(args, config):
 
                 # Only evaluate on the primary node (for now).
                 if primary:
-                    print('begin evaluation')
+                    print('*** Begin evaluation ***')
                     eval_time = time.time()
                     model.eval()
+                    
                     val_loss, val_task_losses, val_scores, _ = satlas.model.evaluate.evaluate(
                         config=config,
                         model=model,
@@ -357,7 +356,26 @@ def main(args, config):
                         half_enabled=half_enabled,
                     )
                     val_score = np.mean(val_scores)
+                    # print('val_loss: {}, val_task_losses: {}'.format(val_loss, val_task_losses))
                     model.train()
+
+
+                    summary_epoch += 1                   
+                    print('### summary_epoch {}: train_loss={} (losses={}) val_loss={} (losses={}) val={}/{} (scores={}) elapsed={},{} lr={}'.format(
+                        summary_epoch,
+                        train_loss,
+                        train_task_losses,
+                        val_loss,
+                        val_task_losses,
+                        val_score,
+                        best_score,
+                        val_scores,
+                        int(eval_time-summary_prev_time),
+                        int(time.time()-eval_time),
+                        optimizer.param_groups[0]['lr'],
+                    ))
+
+                    # print('list train lost before: ', list_train_loss)
 
                     list_epoch.append(epoch)
                     list_summary_epoch.append(summary_epoch)
@@ -369,28 +387,13 @@ def main(args, config):
                     list_best_score.append(best_score)
                     list_val_scores.append(val_scores)
                     
-                    
-                    print('summary_epoch {}: train_loss={} (losses={}) val_loss={} (losses={}) val={}/{} (scores={}) elapsed={},{} lr={}'.format(
-                        list_summary_epoch[-1],
-                        list_train_loss[-1],
-                        list_train_task_losses[-1],
-                        list_val_loss[-1],
-                        list_val_task_losses[-1],
-                        list_val_score[-1],
-                        list_best_score[-1],
-                        list_val_scores[-1],
-                        int(eval_time-summary_prev_time),
-                        int(time.time()-eval_time),
-                        optimizer.param_groups[0]['lr'],
-                    ))
-
-                    summary_epoch += 1
                     summary_prev_time = time.time()
+
+                    # print('list train lost after: ', list_train_loss)
 
                     # Model saving.
                     if is_distributed:
                         # Need to access underlying model in the DistributedDataParallel so keys aren't prefixed with "module.X".
-                        # state_dict = model.module.state_dict()
                         state_dict = {
                             'model_state_dict': model.module.state_dict(),
                             'epoch': list_epoch,
@@ -409,10 +412,8 @@ def main(args, config):
                             'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
                         }
                     else:
-                        # state_dict = model.state_dict()
-                        print('not distributed')
                         state_dict = {
-                            'model_state_dict': model.module.state_dict(),
+                            'model_state_dict': model.state_dict(),
                             'epoch': list_epoch,
                             'summary_epoch': list_summary_epoch,
                             'train_loss': list_train_loss,
@@ -432,7 +433,7 @@ def main(args, config):
 
                     if np.isfinite(val_score) and (best_score is None or val_score > best_score):
                         state_dict = {
-                            'model_state_dict': model.module.state_dict(),
+                            'model_state_dict': model.state_dict(),
                             'epoch': list_epoch,
                             'summary_epoch': list_summary_epoch,
                             'train_loss': list_train_loss,
@@ -452,7 +453,7 @@ def main(args, config):
                         best_score = val_score
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train model.")
+    parser = argparse.ArgumentParser(description="Resume Training model.")
     parser.add_argument("--config_path", help="Configuration file path.")
     parser.add_argument("--local-rank", type=int, default=None)
     parser.add_argument("--world_size", type=int, default=1)
