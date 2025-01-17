@@ -7,12 +7,13 @@ import time
 import torch
 import torchvision
 from torch.autograd import Variable
-
+from tqdm import tqdm
 import satlas.model.dataset
 import satlas.model.evaluate
 import satlas.model.models
 import satlas.model.util
 import satlas.transforms
+import pandas as pd
 
 def make_warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor, warmup_delay=0):
     def f(x):
@@ -161,6 +162,7 @@ def main(args, config):
     # Half-precision stuff.
     half_enabled = config.get('Half', False)
     scaler = torch.cuda.amp.GradScaler(enabled=half_enabled)
+    print(f"Scaler state: {scaler.get_scale()}")
 
     # Load model if requested.
     resume_path = config.get('ResumePath', None)
@@ -183,6 +185,37 @@ def main(args, config):
     model = model.to(device)
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+    parameter_list = []
+    layer_summaries = {
+        "Backbone": 0,
+        "Intermediates": 0,
+        "Heads": 0
+    }
+    # # Duyệt qua các tham số
+    # for name, param in model.named_parameters():
+    #     parameter_list.append({
+    #         "Layer": name,
+    #         "Shape": list(param.shape),
+    #         "Number of Parameters": param.numel(),
+    #         "Device": param.device
+    #     })
+    
+    # Chuyển đổi sang bảng pandas để hiển thị gọn hơn
+    # Phân loại tham số dựa trên tên
+    for name, param in model.named_parameters():
+        if "backbone" in name:
+            layer_summaries["Backbone"] += param.numel()
+        elif "intermediate" in name:
+            layer_summaries["Intermediates"] += param.numel()
+        elif "head" in name:
+            layer_summaries["Heads"] += param.numel()
+    
+    # Chuyển kết quả sang dataframe để in ra
+    df = pd.DataFrame([
+        {"Layer Type": key, "Total Parameters": value}
+        for key, value in layer_summaries.items()
+    ])
+    print(df)
 
     # Prepare save directory.
     save_path = config['SavePath']
@@ -203,14 +236,14 @@ def main(args, config):
                     should_freeze = True
                     break
             if should_freeze:
-                if primary: print('freeze', name)
+                # if primary: print('freeze', name)
                 param.requires_grad = False
                 freeze_params.append((name, param))
         if 'Unfreeze' in config:
             unfreeze_iters = config['Unfreeze'] // batch_size // args.world_size
             def unfreeze_hook():
                 for name, param in freeze_params:
-                    if primary: print('unfreeze', name)
+                    # if primary: print('unfreeze', name)
                     param.requires_grad = True
 
     # Configure learning rate schedulers.
@@ -269,7 +302,7 @@ def main(args, config):
         accumulate_freq = config['EffectiveBatchSize'] // batch_size // args.world_size
     else:
         accumulate_freq = 1
-
+    model = model.to('cuda:0')
     model.train()
     for epoch in range(start_epoch, num_epochs):
         if num_iters > 0 and cur_iterations > num_iters:
@@ -279,8 +312,16 @@ def main(args, config):
 
         model.train()
         optimizer.zero_grad()
+        
+        train_loader_tqdm = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{num_epochs}",
+            unit="batch",
+            leave=True,
+            dynamic_ncols=True,
+        )
 
-        for images, targets, info in train_loader:
+        for images, targets, info in train_loader_tqdm:
             cur_iterations += 1
 
             images = [image.to(device).float()/255 for image in images]
@@ -303,12 +344,31 @@ def main(args, config):
             if loss == 0.0:
                 loss = Variable(loss, requires_grad=True)
 
-            scaler.scale(loss).backward()
+            params = [p for p in model.parameters() if p.requires_grad]
+            if len(params) == 0:
+                raise ValueError("Optimizer has no parameters to optimize.")
+            print(f"Optimizer state dict: {optimizer.state_dict().keys()}")
+            if not torch.isfinite(loss):
+                print(f"Invalid loss value: {loss}")
+                continue
+            try:
+                scaler.scale(loss).backward()
+                # scaler.step(optimizer)
+                # scaler.update()
+            except Exception as e:
+                print(f"Error during scaler.step: {e}")
+                raise
+            print(f"Model device: {next(model.parameters()).device}")
+            print(f"Loss device: {loss.device}")
+            print(f"Optimizer device: {optimizer.param_groups[0]['params'][0].device}")
+
 
             if cur_iterations == 1 or cur_iterations % accumulate_freq == 0:
-                # scaler.step(optimizer)
+                scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                
+            train_loader_tqdm.set_postfix(loss=loss.item())
 
             for task_idx in range(len(config['Tasks'])):
                 train_losses[task_idx].append(losses[task_idx].item())
@@ -451,6 +511,8 @@ def main(args, config):
                         }
                         save_atomic(state_dict, save_path, 'best.pth')
                         best_score = val_score
+
+    train_loader_tqdm.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Resume Training model.")
