@@ -11,9 +11,14 @@ import skimage.morphology
 import tqdm
 import torch
 import torchvision
-
+import cv2
+from skimage.morphology import skeletonize
 import satlas.model.dataset
 import satlas.util
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
+from torchvision.ops import nms
+from skimage.measure import find_contours
 
 # Match predicted points with ground truth points to compute precision and recall.
 def compute_loc_performance(gt_array, pred_array, eval_type, distance_tolerance, iou_threshold):
@@ -325,6 +330,7 @@ class DetectF1Evaluator(object):
             self.thresholds = [[threshold] for threshold in params]
         else:
             self.thresholds = [[0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95] for _ in range(num_classes)]
+            # self.thresholds = [list(np.arange(0.05, 1.0, 0.05)) for _ in range(num_classes)]
 
         self.true_positives = [[0]*len(self.thresholds[i]) for i in range(len(self.thresholds))]
         self.false_positives = [[0]*len(self.thresholds[i]) for i in range(len(self.thresholds))]
@@ -385,10 +391,14 @@ class DetectF1Evaluator(object):
     def score(self):
         best_scores = []
         best_thresholds = []
+        best_precisions = []
+        best_recalls = []
 
         for cls_idx, cls_thresholds in enumerate(self.thresholds):
             best_score = None
             best_threshold = None
+            best_precision = None
+            best_recall = None
 
             if cls_idx == 0:
                 best_thresholds.append(0.5)
@@ -420,15 +430,19 @@ class DetectF1Evaluator(object):
                 if best_score is None or f1 > best_score:
                     best_score = f1
                     best_threshold = threshold
+                    best_precision = precision
+                    best_recall = recall
 
+            best_precisions.append(best_precision)
+            best_recalls.append(best_recall)
             best_scores.append(best_score)
             best_thresholds.append(best_threshold)
 
         # In all-background-class cases, avoid divide-by-zero errors
         if len(best_scores) == 0:
-            return 0.0, best_thresholds
+            return 0.0, best_thresholds, best_precisions, best_recalls
 
-        return sum(best_scores) / len(best_scores), best_thresholds
+        return sum(best_scores) / len(best_scores), best_thresholds, best_precisions, best_recalls
 
 class ClassificationAccuracyEvaluator(object):
     def __init__(self, task, spec, detail_func=None, params=None):
@@ -631,6 +645,38 @@ def segmentation_mask_to_color(task, label_im, gt=None):
 
     return vis
 
+def segmentation_centerline(task, label_im, image, gt=None):
+    if task['type'] == 'bin_segment':
+        if label_im.dtype != bool:
+            # convert to boolean array
+            label_im = label_im > 0.5 # shape (6, 512, 512) with 6 classes
+            
+        vis = np.zeros((label_im.shape[1], label_im.shape[2], 3), dtype='uint8')
+
+        for cls in range(len(label_im)):  # 6 classes for sentinel-2 and 47 classes for aerial
+            if cls == 26:
+                # Tạo một mask nhị phân từ `label_im`
+                # print(label_im[26])
+                
+                mask = label_im[cls] > 0  # Chuyển lớp hiện tại thành nhị phân
+                
+                # Chuyển đổi từ đường viền thành đường trung tâm (skeleton)
+                centerline = skeletonize(mask)
+                
+                kernel = np.ones((3, 3), np.uint8)  # Kích thước kernel xác định độ dày (3x3 là thêm độ dày 1 pixel)
+                dilated_centerline = cv2.dilate(centerline.astype(np.uint8), kernel, iterations=1)
+
+                # Vẽ đường giãn nở lên ảnh
+                coords = np.column_stack(np.where(dilated_centerline))
+                color = [min(c + 50, 255) for c in task['colors'][cls]]
+                for coord in coords:
+                    image[coord[0], coord[1]] = task['colors'][cls]
+
+        for cls, color in enumerate(task['colors']):
+            vis[label_im[cls, :, :]] = color
+
+    return image
+
 def visualize_outputs(task, image, outputs, targets=None, return_vis=False, return_out=False, evaluator_params=None):
     '''
     Returns output visualization and/or raw outputs given the task dict, input image, and outputs.
@@ -678,9 +724,9 @@ def visualize_outputs(task, image, outputs, targets=None, return_vis=False, retu
             cur_outputs_bin = cur_outputs > 0.5
 
         if return_vis:
-            vis_output = segmentation_mask_to_color(task, cur_outputs_bin)
+            vis_output = segmentation_centerline(task, cur_outputs_bin, image)
             if targets:
-                vis_gt = segmentation_mask_to_color(task, targets['im'].numpy() > 0.5)
+                vis_gt = segmentation_centerline(task, targets['im'].numpy() > 0.5)
 
         if return_out:
             enc = satlas.util.encode_multiclass_binary(cur_outputs_bin.transpose(1, 2, 0))
@@ -757,6 +803,14 @@ def visualize_outputs(task, image, outputs, targets=None, return_vis=False, retu
             raw_output_format = 'json'
 
     elif task_type == 'instance':
+        outputs = apply_nms(outputs, iou_threshold=0.3)
+        masks = []
+        for mask in outputs['masks']:
+            mask = mask.cpu().numpy().squeeze() > 0.5
+            simplified = simplify_polygon(mask, tolerance=0.5)
+            if simplified:
+                regularized = regularize_polygon(simplified, grid_size=5.0, angle_tolerance=0.5)
+                masks.append(regularized)
         output_boxes = outputs['boxes'].long().cpu().numpy()
         output_scores = outputs['scores'].cpu().numpy()
         output_categories = outputs['labels'].cpu().numpy()
@@ -788,7 +842,7 @@ def visualize_outputs(task, image, outputs, targets=None, return_vis=False, retu
                 color = get_color(outputs['labels'][box_idx].item())
                 for coords in polygons:
                     exterior = np.array(coords[0], dtype=np.int32)
-                    rows, cols = skimage.draw.polygon(exterior[:, 1], exterior[:, 0], shape=(vis_output.shape[0], vis_output.shape[1]))
+                    rows, cols = skimage.draw.polygon_perimeter(exterior[:, 1], exterior[:, 0], shape=(vis_output.shape[0], vis_output.shape[1]))
                     vis_output[rows, cols, :] = color
 
             if targets:
@@ -822,7 +876,76 @@ def visualize_outputs(task, image, outputs, targets=None, return_vis=False, retu
 
     return vis_output, vis_gt, raw_outputs, raw_output_format
 
-def evaluate(config, model, device, loader, half_enabled=False, vis_dir=None, probs_dir=None, out_dir=None, print_details=False, evaluator_params_list=None):
+def simplify_polygon(mask, tolerance=2.0):
+    """Simplify polygon using Douglas-Peucker Algorithm."""
+    contours = find_contours(mask, 0.5)
+    polygons = []
+    for contour in contours:
+        # Bỏ qua contour không đủ điểm
+        if len(contour) < 4:
+            continue
+        poly = Polygon(contour[:, ::-1])  # Đảo ngược trục (y, x) -> (x, y)
+        if poly.is_valid and poly.area > 100:  # Lọc polygon nhỏ
+            simplified_poly = poly.simplify(tolerance, preserve_topology=True)
+            if simplified_poly.is_valid and simplified_poly.area > 100:
+                polygons.append(simplified_poly)
+    return unary_union(polygons) if polygons else None
+
+def apply_nms(out, iou_threshold=0.5):
+    """
+    Áp dụng Non-Maximum Suppression (NMS) cho các đa giác trong output.
+    """
+    boxes = out['boxes']  # (N, 4) - bounding boxes
+    scores = out['scores']  # (N,) - confidence scores
+    masks = out['masks']
+    # Áp dụng NMS
+    keep_indices = nms(boxes, scores, iou_threshold)
+
+    # Lọc các đối tượng được giữ lại
+    out['boxes'] = boxes[keep_indices]
+    out['labels'] = out['labels'][keep_indices]
+    out['scores'] = scores[keep_indices]
+    out['masks'] = masks[keep_indices]
+
+    return out
+
+def regularize_polygon(polygon, grid_size=1.0, angle_tolerance=5.0):
+    """Regularize the edges of a polygon to align with straight lines or right angles."""
+    if polygon.is_empty or not isinstance(polygon, Polygon):
+        return polygon  # Skip empty or non-polygon geometries
+
+    def snap_to_grid(coord, grid_size):
+        return round(coord / grid_size) * grid_size
+
+    def snap_coords_to_grid(coords, grid_size):
+        return [(snap_to_grid(x, grid_size), snap_to_grid(y, grid_size)) for x, y in coords]
+
+    snapped_coords = snap_coords_to_grid(list(polygon.exterior.coords), grid_size)
+
+    def regularize_angle(p1, p2, p3, angle_tolerance):
+        v1 = np.array(p1) - np.array(p2)
+        v2 = np.array(p3) - np.array(p2)
+        angle = np.arctan2(v2[1], v2[0]) - np.arctan2(v1[1], v1[0])
+        angle = np.degrees(angle) % 180
+
+        if abs(angle - 90) <= angle_tolerance or abs(angle - 180) <= angle_tolerance:
+            return p2  # Already aligned
+        else:
+            avg_x = (p1[0] + p3[0]) / 2
+            avg_y = (p1[1] + p3[1]) / 2
+            return (snap_to_grid(avg_x, grid_size), snap_to_grid(avg_y, grid_size))
+
+    regularized_coords = []
+    coords = snapped_coords
+    for i in range(len(coords) - 2):
+        p1, p2, p3 = coords[i], coords[i + 1], coords[i + 2]
+        p2 = regularize_angle(p1, p2, p3, angle_tolerance)
+        regularized_coords.append(p2)
+
+    regularized_coords.append(regularized_coords[0])  # Close the polygon
+    return Polygon(regularized_coords)
+
+def evaluate(config, model, device, loader, half_enabled=False, vis_dir=None, probs_dir=None, out_dir=None, print_details=True, evaluator_params_list=None):
     # Is a specific task chosen for evaluation?
     selected_task = config.get('EvaluateTask', None)
 
@@ -905,17 +1028,20 @@ def evaluate(config, model, device, loader, half_enabled=False, vis_dir=None, pr
                 elif task_type == 'detect' or task_type == 'instance':
                     gt = []
                     pred = []
+                    valid = torch.stack([target[task_idx]['valid'] != 0 for target in targets], dim=0)
                     for target, output in zip(gpu_targets, outputs[task_idx]):
                         if not target[task_idx]['valid']:
                             continue
                         gt.append({
                             'boxes': target[task_idx]['boxes'].cpu(),
                             'labels': target[task_idx]['labels'].cpu(),
+                            'masks': target[task_idx]['masks'].cpu(),
                         })
                         pred.append({
                             'boxes': output['boxes'].cpu(),
                             'labels': output['labels'].cpu(),
                             'scores': output['scores'].cpu(),
+                            'masks': output['masks'].cpu()
                         })
                     evaluators[task_idx].evaluate(gt, pred)
 
@@ -959,7 +1085,7 @@ def evaluate(config, model, device, loader, half_enabled=False, vis_dir=None, pr
                         )
 
                         if vis_output is not None:
-                            skimage.io.imsave(os.path.join(vis_dir, '{}_im.png'.format(save_prefix)), image)
+                            # skimage.io.imsave(os.path.join(vis_dir, '{}_im.png'.format(save_prefix)), image)
                             skimage.io.imsave(os.path.join(vis_dir, '{}_out.png'.format(save_prefix)), vis_output)
                         if vis_gt is not None:
                             skimage.io.imsave(os.path.join(vis_dir, '{}_gt.png'.format(save_prefix)), vis_gt)
@@ -978,11 +1104,14 @@ def evaluate(config, model, device, loader, half_enabled=False, vis_dir=None, pr
 
         avg_loss = np.mean([loss for losses in all_losses for loss in losses])
         avg_losses = [np.mean(losses) for losses in all_losses]
-
+        precisions = []
+        recalls = []
         avg_scores = []
         final_evaluator_params = []
         for evaluator in evaluators:
-            score, params = evaluator.score()
+            score, params, precision, recall = evaluator.score()
+            precisions.append(precision)
+            recalls.append(recall)
             avg_scores.append(score)
             final_evaluator_params.append(params)
 
@@ -990,4 +1119,4 @@ def evaluate(config, model, device, loader, half_enabled=False, vis_dir=None, pr
         for k, v in details.items():
             print(k, np.mean(v))
 
-    return avg_loss, avg_losses, avg_scores, final_evaluator_params
+    return avg_loss, avg_losses, avg_scores, final_evaluator_params, precisions, recalls

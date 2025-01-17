@@ -799,9 +799,6 @@ class Model(torch.nn.Module):
             self.heads.append(head)
         self.heads = torch.nn.ModuleList(self.heads)
 
-        print('backbone_channels:', backbone_channels)
-        print(self)
-
     def forward(self, image_list, targets=None, selected_task=None):
         images = torch.stack(image_list, dim=0)
 

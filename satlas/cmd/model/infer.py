@@ -123,7 +123,7 @@ def main(args):
         )
 
         print('tuning thresholds...')
-        _, _, _, evaluator_params_list = satlas.model.evaluate.evaluate(
+        _, _, _, evaluator_params_list, _, _ = satlas.model.evaluate.evaluate(
             config=config,
             model=model,
             device=device,
@@ -134,7 +134,7 @@ def main(args):
         )
 
     print('evaluating...')
-    test_loss, test_losses, test_scores, _ = satlas.model.evaluate.evaluate(
+    test_loss, test_losses, test_scores, evaluator_params_list, precision, recall = satlas.model.evaluate.evaluate(
         config=config,
         model=model,
         device=device,
@@ -146,7 +146,8 @@ def main(args):
         print_details=args.details,
         evaluator_params_list=evaluator_params_list,
     )
-    print('loss={} losses={} scores={}'.format(test_loss, test_losses, test_scores))
+    print(evaluator_params_list)
+    print('loss={} losses={} scores={} precision={} recall={}'.format(test_loss, test_losses, test_scores, precision, recall))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Apply model on test set.")
@@ -159,11 +160,12 @@ if __name__ == "__main__":
     parser.add_argument("--image_list", help="Override image list.", default=None)
     parser.add_argument("--details", help="Print detailed scores", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--evaluator_params", help="Override evaluator params", default=None)
-    parser.add_argument("--pick_threshold", help="Tune threshold on validation set", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--pick_threshold", help="Tune threshold on validation set", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--weights", help="Path to weights, override SavePath", default=None)
     parser.add_argument("--batch_size", help="Override batch size.", type=int, default=None)
     parser.add_argument("--num_images", help="Override NumImages.", type=int, default=None)
     parser.add_argument("--max_tiles", help="Override TestMaxTiles.", type=int, default=None)
+    parser.add_argument("--nms_threshold", help="NMS threshold", type=float, default=0.5)
     args = parser.parse_args()
 
     main(args)
